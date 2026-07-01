@@ -1,0 +1,94 @@
+server.jsconst express = require('express');
+const { Server } = require('ws');
+const http = require('http');
+
+const PORT = process.env.PORT || 3000;
+const app = express();
+
+// Basic health check endpoint for Railway monitoring
+app.get('/', (req, res) => {
+    res.send('Drivers of Europe 3 Backend Server is Running.');
+});
+
+const server = http.createServer(app);
+const wss = new Server({ server });
+
+// Mock Database (In production, connect Railway's PostgreSQL add-on here)
+let activeDrivers = {};
+let globalBusStops = {
+    "berlin_central": { name: "Berlin Central Station", waitingPassengers: 42 },
+    "paris_nord": { name: "Paris Gare du Nord", waitingPassengers: 19 },
+    "amsterdam_centraal": { name: "Amsterdam Centraal", waitingPassengers: 35 }
+};
+
+wss.on('connection', (ws) => {
+    let driverId = null;
+
+    ws.on('message', (message) => {
+        try {
+            const data = JSON.parse(message);
+
+            switch (data.type) {
+                // Sent by Unity when a driver connects
+                case 'REGISTER_DRIVER':
+                    driverId = data.driverName;
+                    activeDrivers[driverId] = { cash: 500, passengers: 0, lat: 0, lng: 0 };
+                    console.log(`Driver connected: ${driverId}`);
+                    ws.send(JSON.stringify({ type: 'WELCOME', stops: globalBusStops }));
+                    break;
+
+                // Sent by Unity whenever a passenger boards the bus
+                case 'PASSENGER_BOARDED':
+                    if (driverId && globalBusStops[data.stopId].waitingPassengers > 0) {
+                        globalBusStops[data.stopId].waitingPassengers--;
+                        activeDrivers[driverId].passengers++;
+                        activeDrivers[driverId].cash += 14.50; // €14.50 ticket price
+
+                        // Broadcast updated bus stop data to ALL online drivers
+                        broadcast({ type: 'STOP_UPDATE', stopId: data.stopId, data: globalBusStops[data.stopId] });
+                        
+                        // Sync driver wallet back to them
+                        ws.send(JSON.stringify({ type: 'ECONOMY_SYNC', cash: activeDrivers[driverId].cash }));
+                    }
+                    break;
+
+                // Continuous GPS/Coordinate updates for multiplayer rendering
+                case 'UPDATE_POSITION':
+                    if (driverId) {
+                        activeDrivers[driverId].lat = data.lat;
+                        activeDrivers[driverId].lng = data.lng;
+                    }
+                    break;
+            }
+        } catch (err) {
+            console.error("Invalid message format received", err);
+        }
+    });
+
+    ws.on('close', () => {
+        if (driverId) {
+            console.log(`Driver disconnected: ${driverId}`);
+            delete activeDrivers[driverId];
+        }
+    });
+});
+
+function broadcast(data) {
+    wss.clients.forEach((client) => {
+        if (client.readyState === 1) {
+            client.send(JSON.stringify(data));
+        }
+    });
+}
+
+// Periodically respawn passengers across Europe every 30 seconds
+setInterval(() => {
+    for (let stop in globalBusStops) {
+        if (globalBusStops[stop].waitingPassengers < 60) {
+            globalBusStops[stop].waitingPassengers += Math.floor(Math.random() * 5) + 1;
+        }
+    }
+    broadcast({ type: 'GLOBAL_STOPS_REFRESH', stops: globalBusStops });
+}, 30000);
+
+server.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
